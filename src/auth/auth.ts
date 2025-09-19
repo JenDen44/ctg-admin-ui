@@ -31,12 +31,12 @@ class Auth {
 
         this.hydrateFromStorage();
 
-        return this.tokens?.refreshToken || '';
+        return this.tokens?.accessToken || '';
     };
 
     getRefreshToken = async () => {
-        if (this.tokens?.accessToken) {
-            return this.tokens.accessToken;
+        if (this.tokens?.refreshToken) {
+            return this.tokens.refreshToken;
         }
 
         this.hydrateFromStorage();
