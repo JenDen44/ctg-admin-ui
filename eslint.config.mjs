@@ -40,6 +40,7 @@ export default defineConfig([
             globals: {
                 ...globals.browser,
                 ...globals.node,
+                NullOr: 'readonly',
             },
             ecmaVersion: 'latest',
             sourceType: 'module',
@@ -150,6 +151,15 @@ export default defineConfig([
                     trailingComma: 'all',
                 },
             ],
+
+            '@typescript-eslint/naming-convention': [
+                'error',
+                {
+                    selector: ['typeAlias', 'interface'],
+                    format: ['PascalCase'],
+                    custom: { regex: '^T[A-Z]', match: true },
+                },
+            ],
         },
     },
 
@@ -161,4 +171,12 @@ export default defineConfig([
 
     // ⬇️ ДОЛЖЕН быть последним: отключает конфликтующие с Prettier правила
     prettierConfig,
+
+    {
+        files: ['**/*.{ts,tsx,js,jsx}'],
+        rules: {
+            curly: ['error', 'all'],
+            'brace-style': ['error', '1tbs', { allowSingleLine: false }],
+        },
+    },
 ]);

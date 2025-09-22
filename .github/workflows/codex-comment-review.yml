@@ -11,23 +11,22 @@ permissions:
 
 jobs:
   review:
-    # Любой новый комментарий внутри PR, содержащий '@codex'
+    # Любой новый комментарий внутри PR, содержащий '/codex'
     if: >
       github.event.issue.pull_request != null &&
-      contains(github.event.comment.body, '@codex')
+      contains(github.event.comment.body, '/codex')
     runs-on: ubuntu-latest
 
     env:
       OPENAI_MODEL: gpt-4.1-mini
 
     steps:
-      - name: Context
+      - name: Контекст
         run: |
           echo "PR_NUMBER=${{ github.event.issue.number }}" >> $GITHUB_ENV
           echo "COMMENT_URL=${{ github.event.comment.html_url }}" >> $GITHUB_ENV
 
-      # (опционально) ограничить, кто может триггерить
-      - name: Gate commenter (optional)
+      - name: Проверка прав комментатора (опционально)
         if: always()
         uses: actions/github-script@v7
         with:
@@ -35,14 +34,15 @@ jobs:
             const assoc = context.payload.comment.author_association;
             const allowed = ['OWNER','MEMBER','COLLABORATOR'];
             if (!allowed.includes(assoc)) {
-              core.info(`Skipping: association = ${assoc}`);
+              core.info(`Пропуск: уровень доступа = ${assoc}`);
               core.setOutput('skip', 'true');
             }
-      - name: Stop if gated
-        if: steps.gate-commenter.outputs.skip == 'true'
-        run: echo "Not allowed" && exit 0
 
-      - name: Fetch GLOBAL diff (all files)
+      - name: Остановить если нет прав
+        if: steps.gate-commenter.outputs.skip == 'true'
+        run: echo "Нет прав для запуска" && exit 0
+
+      - name: Получение полного diff PR
         id: globaldiff
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -53,7 +53,7 @@ jobs:
             -H "Authorization: Bearer $GH_TOKEN" \
             "${{ github.api_url }}/repos/${{ github.repository }}/pulls/${PR}" > global.diff
 
-          MAX=350000  # ~350 KB защиты от переполнения контекста
+          MAX=350000
           if [ $(wc -c < global.diff) -gt $MAX ]; then
             head -c $MAX global.diff > global_trimmed.diff
             mv global_trimmed.diff global.diff
@@ -62,7 +62,7 @@ jobs:
             echo "TRUNCATED=false" >> $GITHUB_ENV
           fi
 
-      - name: Fetch per-file patches (for inline positioning)
+      - name: Получение патчей по файлам (для inline-комментов)
         id: files
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -79,9 +79,9 @@ jobs:
             page=$((page+1))
           done
           jq '[ .[] | {path: .filename, status: .status, patch: .patch} | select(.patch != null) ]' files.json > patches.json
-          echo "Fetched $(jq 'length' patches.json) text patches"
+          echo "Получено $(jq 'length' patches.json) текстовых патчей"
 
-      - name: Build PR-wide AI suggestions (inline + general)
+      - name: Генерация AI-предложений (inline + общие)
         id: ai
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -91,6 +91,8 @@ jobs:
 
           SYS_PROMPT=$(cat << 'EOF'
           Ты — сеньор Frontend-инженер (React + TypeScript + React Query). Тебе дан unified diff ВСЕГО PR.
+          ВАЖНО: отвечай ТОЛЬКО на русском языке. Все поля "message" в JSON должны быть на русском.
+
           Нужно выдать:
           1) Точечные ИНЛАЙН-комментарии к добавленным строкам (если можешь точно привязать).
           2) Общие замечания по PR (кросс-файловые, архитектура, CI, тесты и пр.).
@@ -101,26 +103,17 @@ jobs:
               {
                 "path": "relative/path/to/file.tsx",
                 "match": "<ТОЧНОЕ содержимое одной ДОБАВЛЕННОЙ строки без ведущего '+'>",
-                "message": "<краткий, предметный комментарий (до 2-3 предложений)>",
+                "message": "<краткий, предметный комментарий (до 2-3 предложений, по-русски)>",
                 "severity": "nit|suggestion|warn|error"
               }
-              // не более 30 элементов суммарно
             ],
             "general": [
               {
-                "message": "<общее замечание/риск/рекомендация>",
+                "message": "<общее замечание/риск/рекомендация, по-русски>",
                 "severity": "nit|suggestion|warn|error"
               }
-              // не более 15 элементов
             ]
           }
-
-          Правила:
-          - Комментируй только добавленные строки ('+').
-          - Для React Query учитывай: ключи, кэширование, staleTime, select, error handling, инвалидации.
-          - Для React/TS: эффекты и зависимости, мемоизации, типы, a11y, XSS, i18n.
-          - Не дублируй одинаковые замечания.
-          - Если не можешь точно сопоставить строку — используй "general".
           EOF
           )
 
@@ -135,14 +128,13 @@ jobs:
             -H "Authorization: Bearer '"$OPENAI_API_KEY"'" \
             -d "$REQ" | jq -r '.choices[0].message.content')
 
-          # Попытка распарсить в JSON
           if echo "$RESP" | jq type >/dev/null 2>&1; then
             echo "$RESP" > suggestions.json
           else
             echo '{"inline":[],"general":[{"message":"Модель вернула невалидный JSON.","severity":"warn"}]}' > suggestions.json
           fi
 
-      - name: Create GitHub Review (inline) + PR comment (general)
+      - name: Создание ревью в GitHub (inline) + общий комментарий
         uses: actions/github-script@v7
         with:
           script: |
@@ -154,22 +146,20 @@ jobs:
             const sug = JSON.parse(fs.readFileSync('suggestions.json','utf8'));
             const patches = JSON.parse(fs.readFileSync('patches.json','utf8'));
 
-            // path -> patch lines[]
             const patchMap = new Map();
             for (const f of patches) {
               const lines = (f.patch || '').split('\n');
               patchMap.set(f.path, lines);
             }
 
-            // найти позицию первой строки '+' с точным совпадением текста
             const findPosition = (lines, wanted) => {
               const want = String(wanted || '').trim();
               for (let i=0;i<lines.length;i++) {
                 const line = lines[i];
                 if (!line.startsWith('+')) continue;
-                if (line.startsWith('+++')) continue; // заголовок
+                if (line.startsWith('+++')) continue;
                 const added = line.slice(1).trim();
-                if (added === want) return i+1; // 1-based
+                if (added === want) return i+1;
               }
               return null;
             };
@@ -179,7 +169,6 @@ jobs:
 
             const sevEmoji = s => ({nit:'🧹',suggestion:'💡',warn:'⚠️',error:'🚨'})[String(s||'').toLowerCase()] || '💬';
 
-            // Соберём инлайн-комментарии
             const comments = [];
             for (const it of inline) {
               const path = it.path;
@@ -191,31 +180,29 @@ jobs:
               comments.push({ path, position: pos, body });
             }
 
-            // Опубликуем инлайн-ревью
             if (comments.length > 0) {
               await github.rest.pulls.createReview({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 pull_number: prNumber,
                 event: 'COMMENT',
-                body: `🤖 Codex inline review • ${comments.length} комментариев\n_Triggered by ${process.env.COMMENT_URL}_`,
+                body: `🤖 Codex инлайн-ревью • ${comments.length} комментариев\n_Запущено из ${process.env.COMMENT_URL}_`,
                 comments
               });
             }
 
-            // Сформируем общий текст
             let generalBody = '';
             if (general.length > 0) {
-              generalBody += `### 🤖 Codex PR-wide review (общие замечания)\n`;
+              generalBody += `### 🤖 Codex обзор PR (общие замечания)\n`;
               for (const g of general) {
                 generalBody += `- ${sevEmoji(g.severity)} ${g.message}\n`;
               }
               if (truncated) {
                 generalBody += `\n> ⚠️ Дифф был усечён по размеру для анализа.\n`;
               }
-              generalBody += `\n_Triggered by ${process.env.COMMENT_URL}_`;
+              generalBody += `\n_Запущено из ${process.env.COMMENT_URL}_`;
             } else if (comments.length === 0) {
-              generalBody = `🤖 Codex: замечаний нет.\n_Triggered by ${process.env.COMMENT_URL}_`;
+              generalBody = `🤖 Codex: замечаний нет.\n_Запущено из ${process.env.COMMENT_URL}_`;
             }
 
             if (generalBody) {
@@ -227,5 +214,5 @@ jobs:
               });
             }
 
-      - name: Done
-        run: echo "Review posted for PR #$PR_NUMBER"
+      - name: Завершено
+        run: echo "Ревью опубликовано для PR #$PR_NUMBER"
