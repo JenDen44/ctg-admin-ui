@@ -20,7 +20,7 @@ export const createAuthClient = (options: TAuthClientFactoryOptions) => {
         const { config } = error;
         const apiError = await rejectResponse(error);
 
-        if (!config || apiError.code !== 401) {
+        if (!config || config.retry || apiError.code !== 401) {
             return apiError;
         }
 
@@ -34,8 +34,8 @@ export const createAuthClient = (options: TAuthClientFactoryOptions) => {
                     waiters.push({ resolve, reject });
                 });
             } else {
-                token = await refreshToken();
                 isRefreshing = true;
+                token = await refreshToken();
 
                 resolveWaiters(token);
             }
