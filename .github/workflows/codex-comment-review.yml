@@ -210,37 +210,36 @@ jobs:
           script: |
             const fs = require('fs');
 
-            // максимально безопасный парсер объекта
-            function safeParseObject(path) {
+            // --- Сверх-надёжный парсер JSON-объекта (возвращает {} при любом косяке) ---
+            function readJsonObjectOrEmpty(path) {
               try {
-                const raw = fs.readFileSync(path, 'utf8').trim();
+                if (!fs.existsSync(path)) return {};
+                const raw = String(fs.readFileSync(path, 'utf8') || '').trim();
+                if (!raw) return {};
                 const data = JSON.parse(raw);
-                if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
-                return data;
+                // интересуют только обычные объекты, не null/массивы/строки
+                if (data && typeof data === 'object' && !Array.isArray(data)) return data;
+                return {};
               } catch {
-                return null;
+                return {};
               }
             }
 
             const prNumber = Number(process.env.PR_NUMBER);
             const truncated = process.env.TRUNCATED === 'true';
 
-            // Читаем и нормализуем предложения
-            let sug = safeParseObject('suggestions.json');
-            if (!sug) {
-              // страховка №1: дефолт
-              sug = { inline: [], general: [] };
-            }
+            // --- Читаем предложения модели; при любой проблеме получаем {} ---
+            const sug = readJsonObjectOrEmpty('suggestions.json');
 
-            // страховка №2: вытащить поля с дефолтами
-            const inline = Array.isArray(sug.inline) ? sug.inline : [];
-            const general = Array.isArray(sug.general) ? sug.general : [];
+            // --- Нормализация массивов, даже если полей вовсе нет ---
+            const inline = Array.isArray(sug?.inline) ? sug.inline : [];
+            const general = Array.isArray(sug?.general) ? sug.general : [];
 
-            // Читаем патчи
+            // --- Читаем патчи для inline-позиций (также максимально безопасно) ---
             let patches = [];
             try {
-              const rawP = fs.readFileSync('patches.json', 'utf8').trim();
-              const dataP = JSON.parse(rawP);
+              const rawP = String(fs.readFileSync('patches.json', 'utf8') || '').trim();
+              const dataP = rawP ? JSON.parse(rawP) : [];
               patches = Array.isArray(dataP) ? dataP : [];
             } catch {
               patches = [];
@@ -248,19 +247,22 @@ jobs:
 
             const patchMap = new Map();
             for (const f of patches) {
-              const lines = String(f.patch || '').split('\n');
-              patchMap.set(f.path, lines);
+              const p = f?.path;
+              const patch = f?.patch;
+              if (!p || typeof patch !== 'string') continue;
+              patchMap.set(p, patch.split('\n'));
             }
 
-            // Поиск позиции в patch (позиция = индекс строки патча, начинается с 1)
+            // позиция строки в diff (GitHub ждёт индекс строки патча, начиная с 1)
             const findPosition = (lines, wanted) => {
-              const want = String(wanted || '').trim();
-              for (let i=0;i<lines.length;i++) {
-                const line = lines[i];
-                if (!line || !line.startsWith('+')) continue;
-                if (line.startsWith('+++')) continue; // заголовок
+              if (!Array.isArray(lines) || !wanted) return null;
+              const want = String(wanted).trim();
+              for (let i = 0; i < lines.length; i++) {
+                const line = lines[i] || '';
+                if (!line.startsWith('+')) continue;
+                if (line.startsWith('+++')) continue; // заголовок секции
                 const added = line.slice(1).trim();
-                if (added === want) return i+1;
+                if (added === want) return i + 1;
               }
               return null;
             };
@@ -272,7 +274,7 @@ jobs:
               if (!it || typeof it !== 'object') continue;
               const path = it.path;
               const match = it.match;
-              if (!path || !match) continue;
+              if (!path || typeof match !== 'string') continue;
               const lines = patchMap.get(path);
               if (!lines) continue;
               const pos = findPosition(lines, match);
