@@ -11,6 +11,7 @@ permissions:
 
 jobs:
   review:
+    # Запуск только если это комментарий внутри PR и он содержит '/codex'
     if: >
       github.event.issue.pull_request != null &&
       contains(github.event.comment.body, '/codex')
@@ -42,6 +43,7 @@ jobs:
         if: steps.gate-commenter.outputs.skip == 'true'
         run: echo "Нет прав для запуска" && exit 0
 
+      # Сообщение о старте ревью
       - name: Сообщение о старте ревью
         uses: actions/github-script@v7
         with:
@@ -135,8 +137,10 @@ jobs:
             -H "Authorization: Bearer '"$OPENAI_API_KEY"'" \
             -d "$REQ" | jq -r '.choices[0].message.content // ""')
 
+          # Лог: сохраняем сырой ответ модели
           printf "%s" "$RAW" > raw_model_response.txt
 
+          # Снимаем возможные кодовые блоки ```json ... ```
           CLEAN=$(printf "%s" "$RAW" | sed -E '1,/^```[a-zA-Z0-9]*$/d; /^```$/,$d' || true)
           if [ -z "$CLEAN" ]; then CLEAN="$RAW"; fi
 
@@ -148,15 +152,18 @@ jobs:
             echo '{"inline":[],"general":[{"message":"Модель вернула невалидный JSON или null.","severity":"warn"}]}' > suggestions.json
           fi
 
+          # Нормализация: гарантируем массивы
           jq '{
                 inline: ( .inline // [] | arrays ),
                 general:( .general // [] | arrays )
               }' suggestions.json > suggestions.normalized.json
           mv suggestions.normalized.json suggestions.json
 
+          # Экспортируем флаги/пути в outputs шага
           echo "valid=$VALID" >> "$GITHUB_OUTPUT"
           echo "raw_file=raw_model_response.txt" >> "$GITHUB_OUTPUT"
 
+      # Диагностика, если ответ модели невалиден
       - name: Диагностика ответа модели (если невалиден)
         if: steps.ai.outputs.valid != 'true'
         uses: actions/github-script@v7
@@ -185,42 +192,73 @@ jobs:
               body
             });
 
+      # Отладка содержимого suggestions.json
+      - name: Debug suggestions.json
+        run: |
+          echo "---- suggestions.json (exists?) ----"
+          ls -l suggestions.json || true
+          echo "---- suggestions.json (first 400 chars) ----"
+          head -c 400 suggestions.json || true
+          echo
+          echo "---- jq type ----"
+          (jq -r 'type' suggestions.json 2>/dev/null) || echo "jq failed"
+
       - name: Создание ревью в GitHub (inline) + общий комментарий
         id: publish
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            function safeParse(path, fallback) {
+
+            // максимально безопасный парсер объекта
+            function safeParseObject(path) {
               try {
-                const txt = fs.readFileSync(path, 'utf8').trim();
-                const data = JSON.parse(txt);
-                return (data && typeof data === 'object') ? data : fallback;
+                const raw = fs.readFileSync(path, 'utf8').trim();
+                const data = JSON.parse(raw);
+                if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+                return data;
               } catch {
-                return fallback;
+                return null;
               }
             }
 
             const prNumber = Number(process.env.PR_NUMBER);
             const truncated = process.env.TRUNCATED === 'true';
 
-            const sug = safeParse('suggestions.json', { inline: [], general: [] });
+            // Читаем и нормализуем предложения
+            let sug = safeParseObject('suggestions.json');
+            if (!sug) {
+              // страховка №1: дефолт
+              sug = { inline: [], general: [] };
+            }
+
+            // страховка №2: вытащить поля с дефолтами
             const inline = Array.isArray(sug.inline) ? sug.inline : [];
             const general = Array.isArray(sug.general) ? sug.general : [];
 
-            const patches = safeParse('patches.json', []);
+            // Читаем патчи
+            let patches = [];
+            try {
+              const rawP = fs.readFileSync('patches.json', 'utf8').trim();
+              const dataP = JSON.parse(rawP);
+              patches = Array.isArray(dataP) ? dataP : [];
+            } catch {
+              patches = [];
+            }
+
             const patchMap = new Map();
             for (const f of patches) {
               const lines = String(f.patch || '').split('\n');
               patchMap.set(f.path, lines);
             }
 
+            // Поиск позиции в patch (позиция = индекс строки патча, начинается с 1)
             const findPosition = (lines, wanted) => {
               const want = String(wanted || '').trim();
               for (let i=0;i<lines.length;i++) {
                 const line = lines[i];
-                if (!line.startsWith('+')) continue;
-                if (line.startsWith('+++')) continue;
+                if (!line || !line.startsWith('+')) continue;
+                if (line.startsWith('+++')) continue; // заголовок
                 const added = line.slice(1).trim();
                 if (added === want) return i+1;
               }
@@ -231,11 +269,13 @@ jobs:
 
             const comments = [];
             for (const it of inline) {
+              if (!it || typeof it !== 'object') continue;
               const path = it.path;
-              if (!path) continue;
+              const match = it.match;
+              if (!path || !match) continue;
               const lines = patchMap.get(path);
               if (!lines) continue;
-              const pos = findPosition(lines, it.match);
+              const pos = findPosition(lines, match);
               if (!pos) continue;
               const body = `${sevEmoji(it.severity)} ${it.message || 'Проверьте эту строку.'}`;
               comments.push({ path, position: pos, body });
@@ -256,6 +296,7 @@ jobs:
             if (general.length > 0) {
               generalBody += `### 🤖 Codex обзор PR (общие замечания)\n`;
               for (const g of general) {
+                if (!g || typeof g !== 'object') continue;
                 generalBody += `- ${sevEmoji(g.severity)} ${g.message}\n`;
               }
               if (truncated) {
