@@ -1,10 +1,11 @@
-import type { TTokens, TTokensSubscriber } from './auth.types';
+import { tokensSchema } from './schemas';
+import type { TTokens, TAuthSubscriber } from './types';
 
 class Auth {
     private readonly storageKey = 'app.auth.tokens';
     private storage: Storage;
     private broadcastChannel?: BroadcastChannel;
-    private subscribers: Set<TTokensSubscriber> = new Set();
+    private subscribers: Set<TAuthSubscriber> = new Set();
     private tokens: NullOr<TTokens> = null;
 
     constructor() {
@@ -25,13 +26,13 @@ class Auth {
     }
 
     getToken = async () => {
-        if (this.tokens?.accessToken) {
-            return this.tokens.accessToken;
+        if (this.tokens?.token) {
+            return this.tokens.token;
         }
 
         this.hydrateFromStorage();
 
-        return this.tokens?.accessToken || '';
+        return this.tokens?.token || '';
     };
 
     getRefreshToken = async () => {
@@ -60,7 +61,7 @@ class Auth {
         this.broadcastChannel?.postMessage({ type: 'TOKENS_CLEAR' });
     };
 
-    subscribe = (fn: TTokensSubscriber) => {
+    subscribe = (fn: TAuthSubscriber) => {
         this.subscribers.add(fn);
         fn(this.tokens);
 
@@ -81,7 +82,8 @@ class Auth {
         }
 
         try {
-            this.tokens = JSON.parse(storageValue) ?? null;
+            const parsedStorageValue = JSON.parse(storageValue) ?? null;
+            this.tokens = tokensSchema.parse(parsedStorageValue);
         } catch {
             this.removePersisted();
         }
