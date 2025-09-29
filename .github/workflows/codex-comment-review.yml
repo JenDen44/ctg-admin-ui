@@ -203,6 +203,39 @@ jobs:
           echo "---- jq type ----"
           (jq -r 'type' suggestions.json 2>/dev/null) || echo "jq failed"
 
+      - name: Sanitize suggestions.json
+        run: |
+          set -euo pipefail
+          # если файла нет — создаём дефолт
+          if [ ! -f suggestions.json ]; then
+            echo '{"inline":[],"general":[]}' > suggestions.json
+          fi
+
+          RAW="$(cat suggestions.json || true)"
+
+          # Пустой файл или одни пробелы
+          if [ -z "${RAW// }" ]; then
+            echo '{"inline":[],"general":[]}' > suggestions.json
+          else
+            # Если это именно JSON-литерал null — заменяем
+            if echo "$RAW" | jq -e 'type=="null"' >/dev/null 2>&1; then
+              echo '{"inline":[],"general":[]}' > suggestions.json
+            # Если это не объект — тоже заменяем
+            elif ! echo "$RAW" | jq -e 'type=="object"' >/dev/null 2>&1; then
+              echo '{"inline":[],"general":[]}' > suggestions.json
+            else
+              # Обеспечим поля inline/general как массивы
+              echo "$RAW" | jq '{
+                inline: ( .inline // [] | (if type=="array" then . else [] end) ),
+                general: ( .general // [] | (if type=="array" then . else [] end) )
+              }' > suggestions.json.tmp
+              mv suggestions.json.tmp suggestions.json
+            fi
+          fi
+
+          echo "== suggestions.json (sanitized) =="
+          cat suggestions.json
+
       - name: Создание ревью в GitHub (inline) + общий комментарий
         id: publish
         uses: actions/github-script@v7
@@ -210,17 +243,15 @@ jobs:
           script: |
             const fs = require('fs');
 
-            // --- Сверх-надёжный парсер JSON-объекта (возвращает {} при любом косяке) ---
-            function readJsonObjectOrEmpty(path) {
+            // Примитивный надёжный парс: {} при любой проблеме
+            function readJsonObject(path) {
               try {
                 if (!fs.existsSync(path)) return {};
                 const raw = String(fs.readFileSync(path, 'utf8') || '').trim();
                 if (!raw) return {};
                 const data = JSON.parse(raw);
-                // интересуют только обычные объекты, не null/массивы/строки
-                if (data && typeof data === 'object' && !Array.isArray(data)) return data;
-                return {};
-              } catch {
+                return (data && typeof data === 'object' && !Array.isArray(data)) ? data : {};
+              } catch (e) {
                 return {};
               }
             }
@@ -228,44 +259,41 @@ jobs:
             const prNumber = Number(process.env.PR_NUMBER);
             const truncated = process.env.TRUNCATED === 'true';
 
-            // --- Читаем предложения модели; при любой проблеме получаем {} ---
-            const sug = readJsonObjectOrEmpty('suggestions.json');
+            // === Suggestions ===
+            const sug = readJsonObject('suggestions.json');
+            const inline = Array.isArray(sug && sug.inline) ? sug.inline : [];
+            const general = Array.isArray(sug && sug.general) ? sug.general : [];
 
-            // --- Нормализация массивов, даже если полей вовсе нет ---
-            const inline = Array.isArray(sug?.inline) ? sug.inline : [];
-            const general = Array.isArray(sug?.general) ? sug.general : [];
-
-            // --- Читаем патчи для inline-позиций (также максимально безопасно) ---
+            // === Patches ===
             let patches = [];
             try {
-              const rawP = String(fs.readFileSync('patches.json', 'utf8') || '').trim();
-              const dataP = rawP ? JSON.parse(rawP) : [];
-              patches = Array.isArray(dataP) ? dataP : [];
-            } catch {
+              const rawP = String(fs.readFileSync('patches.json','utf8') || '').trim();
+              const p = rawP ? JSON.parse(rawP) : [];
+              patches = Array.isArray(p) ? p : [];
+            } catch (e) {
               patches = [];
             }
 
             const patchMap = new Map();
             for (const f of patches) {
-              const p = f?.path;
-              const patch = f?.patch;
-              if (!p || typeof patch !== 'string') continue;
-              patchMap.set(p, patch.split('\n'));
+              const path = f && f.path;
+              const patch = f && f.patch;
+              if (!path || typeof patch !== 'string') continue;
+              patchMap.set(path, patch.split('\n'));
             }
 
-            // позиция строки в diff (GitHub ждёт индекс строки патча, начиная с 1)
-            const findPosition = (lines, wanted) => {
+            function findPosition(lines, wanted) {
               if (!Array.isArray(lines) || !wanted) return null;
               const want = String(wanted).trim();
               for (let i = 0; i < lines.length; i++) {
                 const line = lines[i] || '';
                 if (!line.startsWith('+')) continue;
-                if (line.startsWith('+++')) continue; // заголовок секции
+                if (line.startsWith('+++')) continue;
                 const added = line.slice(1).trim();
-                if (added === want) return i + 1;
+                if (added === want) return i + 1; // position начинается с 1
               }
               return null;
-            };
+            }
 
             const sevEmoji = s => ({nit:'🧹',suggestion:'💡',warn:'⚠️',error:'🚨'})[String(s||'').toLowerCase()] || '💬';
 
@@ -321,6 +349,7 @@ jobs:
             core.setOutput('inline_count', String(comments.length));
             core.setOutput('general_count', String(general.length));
             core.setOutput('truncated', truncated ? 'true' : 'false');
+
 
       - name: Завершено
         run: echo "Ревью опубликовано для PR #$PR_NUMBER"
