@@ -11,10 +11,9 @@ permissions:
 
 jobs:
   review:
-    # Любой новый комментарий внутри PR, содержащий '/codex'
     if: >
       github.event.issue.pull_request != null &&
-      contains(github.event.comment.body, '/codex')
+      contains(github.event.comment.body, '/review')
     runs-on: ubuntu-latest
 
     env:
@@ -26,27 +25,28 @@ jobs:
           echo "PR_NUMBER=${{ github.event.issue.number }}" >> $GITHUB_ENV
           echo "COMMENT_URL=${{ github.event.comment.html_url }}" >> $GITHUB_ENV
 
-      - name: Проверка прав комментатора (опционально)
-        if: always()
+      - name: Сообщение о старте ревью
         uses: actions/github-script@v7
         with:
           script: |
-            const assoc = context.payload.comment.author_association;
-            const allowed = ['OWNER','MEMBER','COLLABORATOR'];
-            if (!allowed.includes(assoc)) {
-              core.info(`Пропуск: уровень доступа = ${assoc}`);
-              core.setOutput('skip', 'true');
-            }
-
-      - name: Остановить если нет прав
-        if: steps.gate-commenter.outputs.skip == 'true'
-        run: echo "Нет прав для запуска" && exit 0
+            const body = [
+              "🤖 Codex: начал ревью этого PR.",
+              "",
+              `_Запущено из ${process.env.COMMENT_URL}_`
+            ].join("\n");
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number(process.env.PR_NUMBER),
+              body
+            });
 
       - name: Получение полного diff PR
         id: globaldiff
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           PR=$PR_NUMBER
           curl -sSL \
             -H "Accept: application/vnd.github.v3.diff" \
@@ -67,6 +67,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           PR=$PR_NUMBER
           API="${{ github.api_url }}/repos/${{ github.repository }}/pulls/${PR}/files?per_page=100&page="
           page=1
@@ -87,31 +88,20 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL: ${{ env.OPENAI_MODEL }}
         run: |
+          set -euo pipefail
+
           GLOBAL=$(jq -Rs . < global.diff)
 
           SYS_PROMPT=$(cat << 'EOF'
-          Ты — сеньор Frontend-инженер (React + TypeScript + React Query). Тебе дан unified diff ВСЕГО PR.
-          ВАЖНО: отвечай ТОЛЬКО на русском языке. Все поля "message" в JSON должны быть на русском.
+          Ты — сеньор Frontend-инженер (React + TypeScript + React Query). ВАЖНО: отвечай ТОЛЬКО на русском.
 
-          Нужно выдать:
-          1) Точечные ИНЛАЙН-комментарии к добавленным строкам (если можешь точно привязать).
-          2) Общие замечания по PR (кросс-файловые, архитектура, CI, тесты и пр.).
-
-          Формат ОТВЕТА строго JSON:
+          Верни СТРОГО JSON:
           {
             "inline": [
-              {
-                "path": "relative/path/to/file.tsx",
-                "match": "<ТОЧНОЕ содержимое одной ДОБАВЛЕННОЙ строки без ведущего '+'>",
-                "message": "<краткий, предметный комментарий (до 2-3 предложений, по-русски)>",
-                "severity": "nit|suggestion|warn|error"
-              }
+              {"path":"...", "match":"<добавленная_строка>", "message":"...", "severity":"nit|suggestion|warn|error"}
             ],
             "general": [
-              {
-                "message": "<общее замечание/риск/рекомендация, по-русски>",
-                "severity": "nit|suggestion|warn|error"
-              }
+              {"message":"...", "severity":"nit|suggestion|warn|error"}
             ]
           }
           EOF
@@ -123,58 +113,178 @@ jobs:
             --arg content "PR unified diff:\n\n$GLOBAL" \
             '{model:$model, temperature:0.2, messages:[{role:"system",content:$sys},{role:"user",content:$content}] }')
 
-          RESP=$(curl -sS https://api.openai.com/v1/chat/completions \
+          RAW=$(curl -sS https://api.openai.com/v1/chat/completions \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer '"$OPENAI_API_KEY"'" \
-            -d "$REQ" | jq -r '.choices[0].message.content')
+            -d "$REQ" | jq -r '.choices[0].message.content // ""')
 
-          if echo "$RESP" | jq type >/dev/null 2>&1; then
-            echo "$RESP" > suggestions.json
+          # Лог: сохраняем сырой ответ модели
+          printf "%s" "$RAW" > raw_model_response.txt
+
+          # Снимаем возможные кодовые блоки ```json ... ```
+          CLEAN=$(printf "%s" "$RAW" | sed -E '1,/^```[a-zA-Z0-9]*$/d; /^```$/,$d' || true)
+          if [ -z "$CLEAN" ]; then CLEAN="$RAW"; fi
+
+          VALID=false
+          if echo "$CLEAN" | jq -e 'type=="object"' >/dev/null 2>&1; then
+            VALID=true
+            echo "$CLEAN" > suggestions.json
           else
-            echo '{"inline":[],"general":[{"message":"Модель вернула невалидный JSON.","severity":"warn"}]}' > suggestions.json
+            echo '{"inline":[],"general":[{"message":"Модель вернула невалидный JSON или null.","severity":"warn"}]}' > suggestions.json
           fi
 
+          # Нормализация: гарантируем массивы
+          jq '{
+                inline: ( .inline // [] | arrays ),
+                general:( .general // [] | arrays )
+              }' suggestions.json > suggestions.normalized.json
+          mv suggestions.normalized.json suggestions.json
+
+          # Экспортируем флаги/пути в outputs шага
+          echo "valid=$VALID" >> "$GITHUB_OUTPUT"
+          echo "raw_file=raw_model_response.txt" >> "$GITHUB_OUTPUT"
+
+      - name: Диагностика ответа модели (если невалиден)
+        if: steps.ai.outputs.valid != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const prNumber = Number(process.env.PR_NUMBER);
+            let raw = '';
+            try { raw = fs.readFileSync('raw_model_response.txt','utf8'); } catch {}
+            const preview = (raw || '').slice(0, 800);
+            const body = [
+              "⚠️ Codex: ответ модели оказался невалидным JSON, использую дефолтную заготовку без инлайн-комментариев.",
+              "",
+              "Короткий лог (обрезано до 800 символов):",
+              "",
+              "```",
+              preview,
+              "```",
+              "",
+              "_Запущено из " + process.env.COMMENT_URL + "_"
+            ].join("\n");
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body
+            });
+
+      - name: Debug suggestions.json
+        run: |
+          echo "---- suggestions.json (exists?) ----"
+          ls -l suggestions.json || true
+          echo "---- suggestions.json (first 400 chars) ----"
+          head -c 400 suggestions.json || true
+          echo
+          echo "---- jq type ----"
+          (jq -r 'type' suggestions.json 2>/dev/null) || echo "jq failed"
+
+      - name: Sanitize suggestions.json
+        run: |
+          set -euo pipefail
+          # если файла нет — создаём дефолт
+          if [ ! -f suggestions.json ]; then
+            echo '{"inline":[],"general":[]}' > suggestions.json
+          fi
+
+          RAW="$(cat suggestions.json || true)"
+
+          # Пустой файл или одни пробелы
+          if [ -z "${RAW// }" ]; then
+            echo '{"inline":[],"general":[]}' > suggestions.json
+          else
+            # Если это именно JSON-литерал null — заменяем
+            if echo "$RAW" | jq -e 'type=="null"' >/dev/null 2>&1; then
+              echo '{"inline":[],"general":[]}' > suggestions.json
+            # Если это не объект — тоже заменяем
+            elif ! echo "$RAW" | jq -e 'type=="object"' >/dev/null 2>&1; then
+              echo '{"inline":[],"general":[]}' > suggestions.json
+            else
+              # Обеспечим поля inline/general как массивы
+              echo "$RAW" | jq '{
+                inline: ( .inline // [] | (if type=="array" then . else [] end) ),
+                general: ( .general // [] | (if type=="array" then . else [] end) )
+              }' > suggestions.json.tmp
+              mv suggestions.json.tmp suggestions.json
+            fi
+          fi
+
+          echo "== suggestions.json (sanitized) =="
+          cat suggestions.json
+
       - name: Создание ревью в GitHub (inline) + общий комментарий
+        id: publish
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
 
+            // Примитивный надёжный парс: {} при любой проблеме
+            function readJsonObject(path) {
+              try {
+                if (!fs.existsSync(path)) return {};
+                const raw = String(fs.readFileSync(path, 'utf8') || '').trim();
+                if (!raw) return {};
+                const data = JSON.parse(raw);
+                return (data && typeof data === 'object' && !Array.isArray(data)) ? data : {};
+              } catch (e) {
+                return {};
+              }
+            }
+
             const prNumber = Number(process.env.PR_NUMBER);
             const truncated = process.env.TRUNCATED === 'true';
 
-            const sug = JSON.parse(fs.readFileSync('suggestions.json','utf8'));
-            const patches = JSON.parse(fs.readFileSync('patches.json','utf8'));
+            // === Suggestions ===
+            const sug = readJsonObject('suggestions.json');
+            const inline = Array.isArray(sug && sug.inline) ? sug.inline : [];
+            const general = Array.isArray(sug && sug.general) ? sug.general : [];
+
+            // === Patches ===
+            let patches = [];
+            try {
+              const rawP = String(fs.readFileSync('patches.json','utf8') || '').trim();
+              const p = rawP ? JSON.parse(rawP) : [];
+              patches = Array.isArray(p) ? p : [];
+            } catch (e) {
+              patches = [];
+            }
 
             const patchMap = new Map();
             for (const f of patches) {
-              const lines = (f.patch || '').split('\n');
-              patchMap.set(f.path, lines);
+              const path = f && f.path;
+              const patch = f && f.patch;
+              if (!path || typeof patch !== 'string') continue;
+              patchMap.set(path, patch.split('\n'));
             }
 
-            const findPosition = (lines, wanted) => {
-              const want = String(wanted || '').trim();
-              for (let i=0;i<lines.length;i++) {
-                const line = lines[i];
+            function findPosition(lines, wanted) {
+              if (!Array.isArray(lines) || !wanted) return null;
+              const want = String(wanted).trim();
+              for (let i = 0; i < lines.length; i++) {
+                const line = lines[i] || '';
                 if (!line.startsWith('+')) continue;
                 if (line.startsWith('+++')) continue;
                 const added = line.slice(1).trim();
-                if (added === want) return i+1;
+                if (added === want) return i + 1; // position начинается с 1
               }
               return null;
-            };
-
-            const inline = Array.isArray(sug.inline) ? sug.inline : [];
-            const general = Array.isArray(sug.general) ? sug.general : [];
+            }
 
             const sevEmoji = s => ({nit:'🧹',suggestion:'💡',warn:'⚠️',error:'🚨'})[String(s||'').toLowerCase()] || '💬';
 
             const comments = [];
             for (const it of inline) {
+              if (!it || typeof it !== 'object') continue;
               const path = it.path;
+              const match = it.match;
+              if (!path || typeof match !== 'string') continue;
               const lines = patchMap.get(path);
               if (!lines) continue;
-              const pos = findPosition(lines, it.match);
+              const pos = findPosition(lines, match);
               if (!pos) continue;
               const body = `${sevEmoji(it.severity)} ${it.message || 'Проверьте эту строку.'}`;
               comments.push({ path, position: pos, body });
@@ -195,6 +305,7 @@ jobs:
             if (general.length > 0) {
               generalBody += `### 🤖 Codex обзор PR (общие замечания)\n`;
               for (const g of general) {
+                if (!g || typeof g !== 'object') continue;
                 generalBody += `- ${sevEmoji(g.severity)} ${g.message}\n`;
               }
               if (truncated) {
@@ -214,5 +325,36 @@ jobs:
               });
             }
 
+            core.setOutput('inline_count', String(comments.length));
+            core.setOutput('general_count', String(general.length));
+            core.setOutput('truncated', truncated ? 'true' : 'false');
+
+
       - name: Завершено
         run: echo "Ревью опубликовано для PR #$PR_NUMBER"
+
+      - name: Сообщение о завершении ревью (с счётчиком + пинг автора)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const inlineCount = Number('${{ steps.publish.outputs.inline_count || 0 }}');
+            const generalCount = Number('${{ steps.publish.outputs.general_count || 0 }}');
+            const truncated = '${{ steps.publish.outputs.truncated || 'false' }}' === 'true';
+            const actor = process.env.GITHUB_ACTOR || '${{ github.actor }}';
+
+            const parts = [
+              `🤖 Codex: ревью завершено ✅`,
+              ``,
+              `Итог: ${inlineCount} инлайн, ${generalCount} общих замечаний.` + (truncated ? `\n> ⚠️ Дифф был усечён для анализа.` : ''),
+              ``,
+              `Запустил: @${actor}`,
+              ``,
+              `_Запущено из ${process.env.COMMENT_URL}_`
+            ];
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number(process.env.PR_NUMBER),
+              body: parts.join("\n")
+            });
