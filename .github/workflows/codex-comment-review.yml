@@ -191,6 +191,46 @@ jobs:
 
           echo "raw_file=raw_model_response.txt" >> "$GITHUB_OUTPUT"
 
+      # ---------- Оценка стоимости ревью ----------
+      - name: Оценка стоимости ревью
+        id: cost
+        env:
+          OPENAI_MODEL: ${{ env.OPENAI_MODEL }}
+        run: |
+          set -euo pipefail
+          # Приблизительно: 1 токен ≈ 4 символа.
+          # Считаем входные токены по размеру исходного diff + небольшой оверхед инструкций (~1200 байт).
+          DIFF_BYTES=$(wc -c < global.diff)
+          OVERHEAD=1200
+          IN_TOK=$(( (DIFF_BYTES + OVERHEAD) / 4 ))
+
+          # Выходные токены — по длине текста, который мы сохранили (raw_model_response.txt).
+          # Если файла нет/пуст — поставим минимальную оценку 100 токенов.
+          if [ -f raw_model_response.txt ]; then
+            OUT_BYTES=$(wc -c < raw_model_response.txt)
+          else
+            OUT_BYTES=0
+          fi
+          OUT_TOK=$(( OUT_BYTES / 4 ))
+          if [ $OUT_TOK -lt 100 ]; then OUT_TOK=100; fi
+
+          MODEL="${OPENAI_MODEL}"
+
+          # Цены за 1K токенов (примерные, можно обновлять под твои реальные)
+          case "$MODEL" in
+            o4-mini|gpt-4o-mini|gpt-4.1-mini) IN_PPM=0.00013; OUT_PPM=0.00050 ;;
+            gpt-4o) IN_PPM=0.00500; OUT_PPM=0.01500 ;;
+            gpt-4-turbo*) IN_PPM=0.01000; OUT_PPM=0.03000 ;;
+            *) IN_PPM=0.00013; OUT_PPM=0.00050 ;;
+          esac
+
+          COST=$(awk -v in_t=$IN_TOK -v out_t=$OUT_TOK -v in_p=$IN_PPM -v out_p=$OUT_PPM 'BEGIN{printf "%.4f", (in_t/1000.0)*in_p + (out_t/1000.0)*out_p}')
+
+          echo "input_tokens=$IN_TOK" >> $GITHUB_OUTPUT
+          echo "output_tokens=$OUT_TOK" >> $GITHUB_OUTPUT
+          echo "cost_usd=$COST" >> $GITHUB_OUTPUT
+
+      # ---------- Диагностика ответа модели (если невалиден) ----------
       - name: Диагностика ответа модели (если невалиден)
         if: steps.ai.outputs.valid != 'true'
         uses: actions/github-script@v7
@@ -322,7 +362,7 @@ jobs:
         run: |
           echo "Ревью опубликовано для PR #$PR_NUMBER"
 
-      - name: Сообщение о завершении ревью (с счётчиком + пинг автора)
+      - name: Сообщение о завершении ревью (с счётчиком + пинг автора + стоимость)
         uses: actions/github-script@v7
         with:
           script: |
@@ -330,11 +370,17 @@ jobs:
             const generalCount = Number('${{ steps.publish.outputs.general_count || 0 }}');
             const truncated = '${{ steps.publish.outputs.truncated || 'false' }}' === 'true';
             const actor = process.env.GITHUB_ACTOR || '${{ github.actor }}';
+            const cost = '${{ steps.cost.outputs.cost_usd || '0.0000' }}';
+            const inTok = '${{ steps.cost.outputs.input_tokens || '0' }}';
+            const outTok = '${{ steps.cost.outputs.output_tokens || '0' }}';
+            const model = '${{ env.OPENAI_MODEL }}';
 
             const parts = [
               `🤖 Codex: ревью завершено ✅`,
               ``,
               `Итог: ${inlineCount} инлайн, ${generalCount} общих замечаний.` + (truncated ? `\n> ⚠️ Дифф был усечён для анализа.` : ''),
+              ``,
+              `Оценка стоимости: ~ $${cost} (in: ${inTok} tok, out: ${outTok} tok, model: ${model})`,
               ``,
               `Запустил: @${actor}`,
               ``,
