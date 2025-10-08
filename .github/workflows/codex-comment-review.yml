@@ -147,15 +147,14 @@ jobs:
             --arg sys "$SYS_PROMPT" \
             --arg content "PR unified diff:\n\n$GLOBAL" \
             '{
-               model: $model,
-               temperature: 0.2,
-               max_completion_tokens: 2000,
-               response_format: { type: "json_object" },
-               messages: [
-                 { role: "system", content: $sys },
-                 { role: "user",   content: $content }
-               ]
-             }')
+              model: $model,
+              max_completion_tokens: 2000,
+              response_format: { type: "json_object" },
+              messages: [
+                { role: "system", content: $sys },
+                { role: "user",   content: $content }
+              ]
+            }')
 
           curl -sS https://api.openai.com/v1/chat/completions \
             -H "Content-Type: application/json" \
